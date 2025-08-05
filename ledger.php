@@ -1,6 +1,7 @@
 <?php
 require_once 'Database.php';
 require_once 'config.php';
+require_once 'functions.php';
 
 // Start session
 session_start();
@@ -71,6 +72,72 @@ class LedgerAnalyzer {
         }
         
         return $this->db->resultSet();
+    }
+    
+    /**
+     * Get officer-specific ledger entries
+     */
+    public function getOfficerLedgerEntries($table_name, $officer_id, $date_from = null, $date_to = null) {
+        $query = "
+            SELECT l.*, t.remitting_staff, t.posting_officer_name
+            FROM {$table_name} l
+            LEFT JOIN account_general_transaction_new t ON l.id = t.id
+            WHERE l.approval_status = 'Approved'
+            AND t.remitting_id = :officer_id
+        ";
+        
+        if ($date_from && $date_to) {
+            $query .= " AND l.date BETWEEN :date_from AND :date_to";
+        } else {
+            $query .= " AND YEAR(l.date) = YEAR(NOW()) AND MONTH(l.date) = MONTH(NOW())";
+        }
+        
+        $query .= " ORDER BY l.date DESC";
+        
+        $this->db->query($query);
+        $this->db->bind(':officer_id', $officer_id);
+        
+        if ($date_from && $date_to) {
+            $this->db->bind(':date_from', $date_from);
+            $this->db->bind(':date_to', $date_to);
+        }
+        
+        return $this->db->resultSet();
+    }
+    
+    /**
+     * Get officer performance summary for ledger
+     */
+    public function getOfficerLedgerSummary($table_name, $officer_id, $date_from = null, $date_to = null) {
+        $query = "
+            SELECT 
+                COUNT(*) as transaction_count,
+                SUM(COALESCE(l.credit_amount, 0)) as total_credits,
+                SUM(COALESCE(l.debit_amount, 0)) as total_debits,
+                AVG(COALESCE(l.credit_amount, 0)) as avg_credit,
+                MAX(COALESCE(l.credit_amount, 0)) as max_credit,
+                MIN(CASE WHEN l.credit_amount > 0 THEN l.credit_amount END) as min_credit
+            FROM {$table_name} l
+            LEFT JOIN account_general_transaction_new t ON l.id = t.id
+            WHERE l.approval_status = 'Approved'
+            AND t.remitting_id = :officer_id
+        ";
+        
+        if ($date_from && $date_to) {
+            $query .= " AND l.date BETWEEN :date_from AND :date_to";
+        } else {
+            $query .= " AND YEAR(l.date) = YEAR(NOW()) AND MONTH(l.date) = MONTH(NOW())";
+        }
+        
+        $this->db->query($query);
+        $this->db->bind(':officer_id', $officer_id);
+        
+        if ($date_from && $date_to) {
+            $this->db->bind(':date_from', $date_from);
+            $this->db->bind(':date_to', $date_to);
+        }
+        
+        return $this->db->single();
     }
     
     /**
@@ -247,6 +314,7 @@ $risk_indicators = [];
 $account_id = $_GET['acct_id'] ?? $_POST['ledger_account'] ?? null;
 $date_from = null;
 $date_to = null;
+$officer_filter = $_GET['officer_id'] ?? null;
 
 // Handle date filtering
 if (isset($_GET['d1']) && isset($_GET['d2'])) {
@@ -264,7 +332,14 @@ if ($account_id) {
     
     if ($account_info) {
         $table_name = $account_info['acct_table_name'];
-        $ledger_entries = $analyzer->getLedgerEntries($table_name, $date_from, $date_to);
+        
+        if ($officer_filter) {
+            $ledger_entries = $analyzer->getOfficerLedgerEntries($table_name, $officer_filter, $date_from, $date_to);
+            $officer_summary = $analyzer->getOfficerLedgerSummary($table_name, $officer_filter, $date_from, $date_to);
+        } else {
+            $ledger_entries = $analyzer->getLedgerEntries($table_name, $date_from, $date_to);
+        }
+        
         $bf_balance = $analyzer->getBroughtForwardBalance($table_name, $date_from);
         $period_totals = $analyzer->getPeriodTotals($table_name, $date_from, $date_to);
         $analytics = $analyzer->getLedgerAnalytics($table_name, $date_from, $date_to);
@@ -273,6 +348,27 @@ if ($account_id) {
 }
 
 $active_accounts = $analyzer->getActiveAccounts();
+
+// Get officers for filtering
+$analyzer->db->query("
+    SELECT DISTINCT 
+        t.remitting_id,
+        CASE 
+            WHEN s.full_name IS NOT NULL THEN s.full_name
+            ELSE so.full_name
+        END as officer_name,
+        CASE 
+            WHEN s.department IS NOT NULL THEN s.department
+            ELSE so.department
+        END as department
+    FROM account_general_transaction_new t
+    LEFT JOIN staffs s ON t.remitting_id = s.user_id
+    LEFT JOIN staffs_others so ON t.remitting_id = so.id
+    WHERE (s.user_id IS NOT NULL OR so.id IS NOT NULL)
+    AND t.date_of_payment >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+    ORDER BY officer_name ASC
+");
+$available_officers = $analyzer->db->resultSet();
 
 // Calculate final balance
 $final_balance = $bf_balance + $period_totals['period_debits'] - $period_totals['period_credits'];
@@ -316,6 +412,12 @@ $final_balance = $bf_balance + $period_totals['period_debits'] - $period_totals[
                     <span class="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-xs font-medium">
                         <?php echo $staff['department']; ?>
                     </span>
+                    <span class="text-sm text-gray-700"><?php echo $account_info['acct_desc']; ?></span>
+                    <?php if ($officer_filter): ?>
+                        <span class="px-2 py-1 bg-blue-100 text-blue-800 rounded text-xs">
+                            Officer Filter Active
+                        </span>
+                    <?php endif; ?>
                 </div>
             </div>
         </div>
@@ -453,6 +555,31 @@ $final_balance = $bf_balance + $period_totals['period_debits'] - $period_totals[
         </div>
         <?php endif; ?>
 
+        <!-- Officer Performance Summary (if officer filter is active) -->
+        <?php if ($officer_filter && isset($officer_summary)): ?>
+        <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+            <h3 class="text-lg font-semibold text-gray-900 mb-4">Officer Performance Summary</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                <div class="text-center">
+                    <div class="text-2xl font-bold text-blue-600"><?php echo $officer_summary['transaction_count']; ?></div>
+                    <div class="text-sm text-gray-500">Transactions</div>
+                </div>
+                <div class="text-center">
+                    <div class="text-2xl font-bold text-green-600">₦<?php echo number_format($officer_summary['total_credits']); ?></div>
+                    <div class="text-sm text-gray-500">Total Credits</div>
+                </div>
+                <div class="text-center">
+                    <div class="text-2xl font-bold text-purple-600">₦<?php echo number_format($officer_summary['avg_credit']); ?></div>
+                    <div class="text-sm text-gray-500">Average per Transaction</div>
+                </div>
+                <div class="text-center">
+                    <div class="text-2xl font-bold text-orange-600">₦<?php echo number_format($officer_summary['max_credit']); ?></div>
+                    <div class="text-sm text-gray-500">Highest Transaction</div>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
+
         <!-- Risk Indicators -->
         <?php if (!empty($risk_indicators)): ?>
         <div class="mb-6">
@@ -511,6 +638,7 @@ $final_balance = $bf_balance + $period_totals['period_debits'] - $period_totals[
         <div class="bg-white rounded-lg shadow-md p-6 mb-6">
             <form method="GET" class="flex flex-col sm:flex-row gap-4 items-end">
                 <input type="hidden" name="acct_id" value="<?php echo $account_id; ?>">
+                <input type="hidden" name="officer_id" value="<?php echo $officer_filter; ?>">
                 
                 <div class="flex-1">
                     <label class="block text-sm font-medium text-gray-700 mb-2">From Date</label>
@@ -524,6 +652,19 @@ $final_balance = $bf_balance + $period_totals['period_debits'] - $period_totals[
                     <input type="date" name="d2" 
                            value="<?php echo $date_to ? date('Y-m-d', strtotime($date_to)) : ''; ?>"
                            class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                
+                <div class="flex-1">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Filter by Officer</label>
+                    <select name="officer_id" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                        <option value="">All Officers</option>
+                        <?php foreach ($available_officers as $officer): ?>
+                            <option value="<?php echo $officer['remitting_id']; ?>" 
+                                    <?php echo $officer_filter == $officer['remitting_id'] ? 'selected' : ''; ?>>
+                                <?php echo $officer['officer_name']; ?> - <?php echo $officer['department']; ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
                 </div>
                 
                 <div class="flex gap-2">
@@ -561,6 +702,9 @@ $final_balance = $bf_balance + $period_totals['period_debits'] - $period_totals[
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Receipt No</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
+                            <?php if ($officer_filter): ?>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Officer</th>
+                            <?php endif; ?>
                             <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Debit (₦)</th>
                             <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Credit (₦)</th>
                             <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Balance (₦)</th>
@@ -601,6 +745,11 @@ $final_balance = $bf_balance + $period_totals['period_debits'] - $period_totals[
                                     <?php echo ucwords(strtolower($entry['trans_desc'])); ?>
                                 </a>
                             </td>
+                            <?php if ($officer_filter): ?>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                    <?php echo $entry['remitting_staff'] ?? 'N/A'; ?>
+                                </td>
+                            <?php endif; ?>
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 text-right">
                                 <?php echo $entry['debit_amount'] ? number_format($entry['debit_amount'], 2) : '-'; ?>
                             </td>
@@ -615,7 +764,7 @@ $final_balance = $bf_balance + $period_totals['period_debits'] - $period_totals[
                     </tbody>
                     <tfoot class="bg-gray-50">
                         <tr>
-                            <th colspan="4" class="px-6 py-3 text-left text-sm font-medium text-gray-900">TOTALS</th>
+                            <th colspan="<?php echo $officer_filter ? '5' : '4'; ?>" class="px-6 py-3 text-left text-sm font-medium text-gray-900">TOTALS</th>
                             <th class="px-6 py-3 text-right text-sm font-bold text-red-600">
                                 <?php echo number_format($period_totals['period_debits'], 2); ?>
                             </th>
